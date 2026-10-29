@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.py[cod]
+.DS_Store
+schema_catalog.json
+semantic_catalog*.json
+*.json.tmp
+models/*.gguf
+models/*.partial
+artifacts/
+.idea/
+train/
+public_test/
+.env
+.env.*
+!.env.example
