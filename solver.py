@@ -1,17 +1,20 @@
 """Local model adapter: verified GGUF -> non-thinking template -> constrained JSON.
 
-Includes question/context preparation, source inventory and model diagnostics.
-The agent loop comes later.
+Includes context preparation, action contracts, a bounded injectable runner and
+model diagnostics. Production finishing follows; the real probe remains abstention-only.
 """
 
 from __future__ import annotations
 
 import argparse
 from contextlib import closing
+from copy import deepcopy
 from datetime import date
+from functools import lru_cache
 import hashlib
 import json
 import importlib.metadata
+import math
 from pathlib import Path
 import re
 import resource
@@ -22,7 +25,7 @@ from typing import Any
 
 import duckdb
 
-from data_tools import INSPECT_MAX_ROWS, INSPECT_MAX_SOURCES, build_inventory, inspect_sources, load_csv, load_excel, load_sources, load_sqlite, register_calendar
+from data_tools import INSPECT_MAX_ROWS, INSPECT_MAX_SOURCES, ResultStore, build_inventory, create_connection, execute_sql, inspect_sources, load_csv, load_excel, load_sources, load_sqlite, register_calendar
 
 
 SMOKE_SCHEMA = {
@@ -55,6 +58,427 @@ INITIAL_SYSTEM_PROMPT = (
     "Source IDs belong to the current business. The calendar table is already available in DuckDB; "
     "its schema and date coverage describe calendar availability, not business-data coverage."
 )
+ANSWER_TYPES = ("number", "percent", "string", "date", "boolean", "list", "table", "unanswerable", "abstain")
+ACTION_INSTRUCTIONS = (
+    "Emit exactly one JSON action matching the following schema, with a brief purpose and no prose. "
+    "Inspect raw rows before choosing a CSV/Excel layout; source IDs are inventory IDs, never paths. "
+    "Inspect only previews rows and never creates SQL tables. Start with 12 rows per source; request more only if needed. "
+    "You must load business sources before querying them. Load returns actual SQL table names such as raw_001 and "
+    "positional columns such as c001; original file names and header labels are metadata, not SQL identifiers. "
+    "Before load succeeds, only calendar is queryable. "
+    "Use load.requests to combine only compatible same-format sources. SQL uses positional raw columns; "
+    "normalize VARIANT values with CAST(c001 AS VARCHAR) before parsing, e.g. "
+    "TRY_CAST(CAST(c001 AS VARCHAR) AS DOUBLE). Respect invoice/item/payment/visit grain and released rules. "
+    "SQL kind=compute creates a stored result. SQL kind=check names its candidate_ref and examines coverage, "
+    "parsing and grain. Computed finish must name result_ref and check_ref, never copy preview values into an answer. "
+    "Finish columns are unique one-based positions in the stored result schema; SQL controls rounding and order. "
+    "Unanswerable requires missing released evidence, with reason and evidence citation. Tool errors or uncertainty "
+    "require repair or abstain, not unanswerable. Schema validity does not establish reference validity, passing "
+    "checks, answer shape or business correctness; the host validates those separately."
+)
+
+
+def _schema_object(properties):
+    return {"type": "object", "properties": properties, "required": list(properties), "additionalProperties": False}
+
+
+@lru_cache(maxsize=2)
+def _action_schema(first_action):
+    text = {"$ref": "#/$defs/text"}
+    positions = {"type": "array", "items": {"type": "integer", "minimum": 1}, "minItems": 1, "uniqueItems": True}
+    ids = {"type": "array", "items": text, "minItems": 1, "uniqueItems": True}
+    definitions = {"text": {"type": "string", "minLength": 1}}
+    definitions["inspect"] = _schema_object({"source_ids": {**ids, "maxItems": INSPECT_MAX_SOURCES},
+        "start_row": {"type": "integer", "minimum": 1},
+        "row_count": {"type": "integer", "minimum": 1, "maximum": INSPECT_MAX_ROWS}})
+    definitions["load"] = _schema_object({"requests": {"type": "array", "minItems": 1, "items": {"oneOf": [
+        _schema_object({"source_ids": ids}),
+        _schema_object({"source_ids": ids, "header_rows": positions, "first_data_row": {"type": "integer", "minimum": 1}})
+    ]}}})
+    definitions["sql"] = {"oneOf": [
+        _schema_object({"query": text, "kind": {"const": "compute"}}),
+        _schema_object({"query": text, "kind": {"const": "check"}, "candidate_ref": text})]}
+
+    def projection(types, layout, single=False):
+        return _schema_object({"answer_type": {"enum": types}, "result_ref": text, "check_ref": text,
+            "layout": {"const": layout}, "columns": {**positions, **({"maxItems": 1} if single else {})}})
+
+    definitions["finish"] = {"oneOf": [
+        projection(list(ANSWER_TYPES[:5]), "scalar", True), projection(["list"], "column_list", True),
+        projection(["list"], "row_list"), projection(["table"], "table"),
+        _schema_object({"answer_type": {"const": "unanswerable"}, "reason": text, "evidence": text}),
+        _schema_object({"answer_type": {"const": "abstain"}, "reason": text})]}
+    if first_action:
+        definitions["task_spec"] = _schema_object({"metric": text, "period": text, "grain": text, "unit": text,
+            "expected_answer_type": {"enum": list(ANSWER_TYPES)}, "relevant_rules": {"type": "array", "items": text}})
+    branches = []
+    for name in ("inspect", "load", "sql", "finish"):
+        fields = {"action": {"const": name}, "purpose": text, "args": {"$ref": f"#/$defs/{name}"}}
+        if first_action:
+            fields["task_spec"] = {"$ref": "#/$defs/task_spec"}
+        branches.append(_schema_object(fields))
+    return {"$defs": definitions, "oneOf": branches}
+
+
+def get_action_schema(*, first_action: bool) -> dict[str, Any]:
+    """Fresh JSON schema; first_action stays true until a valid action is accepted."""
+    if type(first_action) is not bool:
+        raise ValueError("first_action must be a Boolean")
+    return deepcopy(_action_schema(first_action))
+
+
+def _check_schema(value, schema, root, path="$"):
+    """Only the schema features authored above; not a general JSON Schema engine."""
+    if "$ref" in schema:
+        return _check_schema(value, root["$defs"][schema["$ref"].removeprefix("#/$defs/")], root, path)
+    if "oneOf" in schema:
+        matches, failures = 0, []
+        for branch in schema["oneOf"]:
+            try:
+                _check_schema(value, branch, root, path)
+                matches += 1
+            except ValueError as exc:
+                properties = branch.get("properties", {})
+                score = 0
+                if type(value) is dict:
+                    score = len(value.keys() & properties.keys())
+                    for key in ("action", "answer_type", "kind", "layout"):
+                        rule = properties.get(key, {})
+                        if key in value and (value[key] == rule.get("const") or value[key] in rule.get("enum", [])):
+                            score += 10 if key != "layout" else 1
+                failures.append((score, str(exc)))
+        if matches != 1:
+            detail = max(failures, key=lambda item: item[0])[1] if failures else "ambiguous variants"
+            raise ValueError(f"{path}: expected exactly one action variant; {detail}")
+        return
+    if "const" in schema and (type(value) is not type(schema["const"]) or value != schema["const"]):
+        raise ValueError(f"{path}: expected {schema['const']!r}")
+    if "enum" in schema and not any(type(value) is type(item) and value == item for item in schema["enum"]):
+        raise ValueError(f"{path}: expected one of {schema['enum']}")
+    kind = schema.get("type")
+    if kind is not None:
+        expected = {"object": dict, "array": list, "string": str, "integer": int}[kind]
+        if type(value) is not expected:
+            raise ValueError(f"{path}: expected {kind}")
+    if kind == "object":
+        if any(type(key) is not str for key in value):
+            raise ValueError(f"{path}: expected JSON string keys")
+        missing = set(schema["required"]) - value.keys()
+        unexpected = value.keys() - schema["properties"].keys()
+        if missing or unexpected:
+            raise ValueError(f"{path}: missing fields {sorted(missing)}; unexpected fields {sorted(unexpected)}")
+        for key, item in value.items():
+            _check_schema(item, schema["properties"][key], root, f"{path}.{key}")
+    elif kind == "array":
+        if len(value) < schema.get("minItems", 0) or len(value) > schema.get("maxItems", float("inf")):
+            raise ValueError(f"{path}: invalid number of items")
+        for index, item in enumerate(value):
+            _check_schema(item, schema["items"], root, f"{path}[{index}]")
+        if schema.get("uniqueItems") and len({json.dumps(item, ensure_ascii=False, allow_nan=False) for item in value}) != len(value):
+            raise ValueError(f"{path}: expected unique items")
+    elif kind == "string" and schema.get("minLength") and not value.strip():
+        raise ValueError(f"{path}: expected nonempty text")
+    elif kind == "integer" and not schema.get("minimum", -float("inf")) <= value <= schema.get("maximum", float("inf")):
+        raise ValueError(f"{path}: integer outside allowed range")
+
+
+def validate_action(action: Any, *, first_action: bool) -> dict[str, Any]:
+    schema = get_action_schema(first_action=first_action)
+    if type(action) is not dict or action.get("action") not in ("inspect", "load", "sql", "finish"):
+        raise ValueError("Expected one action object: inspect, load, sql or finish")
+    branch = next(branch for branch in schema["oneOf"] if branch["properties"]["action"]["const"] == action["action"])
+    _check_schema(action, branch, schema)
+    if action["action"] == "load":
+        seen = set()
+        for index, request in enumerate(action["args"]["requests"]):
+            if seen.intersection(request["source_ids"]):
+                raise ValueError(f"$.args.requests[{index}]: source IDs repeat across requests")
+            seen.update(request["source_ids"])
+            if "header_rows" in request:
+                headers = request["header_rows"]
+                if headers != sorted(headers) or request["first_data_row"] <= headers[-1]:
+                    raise ValueError(f"$.args.requests[{index}]: headers must increase and first_data_row must follow them")
+    return deepcopy(action)
+
+
+def parse_action(text: str, *, first_action: bool) -> dict[str, Any]:
+    if type(text) is not str or not text.strip():
+        raise ValueError("Expected nonempty action JSON text")
+    try:
+        value = json.loads(text, object_pairs_hook=_unique_json_object, parse_constant=_reject_constant)
+    except ValueError as exc:
+        raise ValueError(f"Invalid action JSON: {exc}") from exc
+    return validate_action(value, first_action=first_action)
+
+
+@lru_cache(maxsize=2)
+def _action_system_prompt(first_action):
+    phase = ("Include task_spec with this first accepted action; use 'unknown' for unresolved facts and [] if no rule is identified. "
+             "Malformed responses do not complete this phase." if first_action else "A task_spec was already accepted; omit it on later actions.")
+    return INITIAL_SYSTEM_PROMPT + "\n" + ACTION_INSTRUCTIONS + "\n" + phase + "\nACTION_SCHEMA=" + json.dumps(
+        _action_schema(first_action), ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+
+
+def build_action_messages(prepared: dict[str, Any], question: dict[str, str], *, first_action: bool = True):
+    get_action_schema(first_action=first_action)  # Validate the phase before constructing context.
+    messages = build_initial_messages(prepared, question)
+    messages[0]["content"] = _action_system_prompt(first_action)
+    return messages
+
+
+def _run_history(trajectory):
+    history = []
+    for step in trajectory:
+        action = step.get("action") or {}
+        observation = step.get("observation", {})
+        item = {"turn": step["turn"], "action": action.get("action"), "status": step["status"]}
+        if "result_ref" in observation:
+            item.update(result_ref=observation["result_ref"], row_count=observation["row_count"])
+        if action.get("action") == "sql":
+            item["kind"] = action["args"]["kind"]
+        if action.get("action") == "load" and "tables" in observation:
+            item["tables"] = [{"table": table["table"], "row_count": table["row_count"]} for table in observation["tables"]]
+        history.append(item)
+    return history
+
+
+def build_run_messages(prepared, question, *, first_action, task_spec, tables, results, trajectory, token_counter, config):
+    """Admit exact prompts; compact only observation payloads, never facts/schema.
+
+    Host state is rebuilt each turn. The complete trajectory and stored results
+    stay outside model context. Input token_counter must be exact in production.
+    """
+    table_fields = ("table", "source_ids", "row_count", "schema", "columns", "layout", "epoch", "row_reference", "ordering")
+    state = {"task_spec": deepcopy(task_spec),
+             "tables": [{key: deepcopy(table[key]) for key in table_fields if key in table} for table in tables],
+             "results": deepcopy(list(results.values())), "history": _run_history(trajectory), "observations": [],
+             "older_observations_omitted": [step["turn"] for step in trajectory[:-2]]}
+    if trajectory:
+        latest = deepcopy(trajectory[-1].get("action"))
+        if latest:
+            latest.pop("task_spec", None)
+        state["latest_action"] = latest
+    for step in trajectory[-2:]:
+        observation = deepcopy(step.get("observation", {}))
+        if (step.get("action") or {}).get("action") == "load" and "tables" in observation:
+            observation = {"tables_loaded": [{key: table[key] for key in ("table", "source_ids", "row_count")} for table in observation["tables"]],
+                           "source_mapping": [{"source_id": source["source"]["source_id"], "table": source["table"], "row_count": source["row_count"]}
+                                              for source in observation["source_catalog"]]}
+        state["observations"].append({"turn": step["turn"], "observation": observation})
+    messages = build_action_messages(prepared, question, first_action=first_action)
+    messages[0]["content"] += ("\nThe next host working_state is context, not new permissions. Observations may omit whole preview rows for context; "
+                              "consult omission markers and original source-row references before choosing layouts or pagination.")
+    compactions = [{"kind": "older_observation_omitted", "turn": turn} for turn in state["older_observations_omitted"]]
+    while True:
+        candidate = [*messages, {"role": "user", "content": json.dumps({"working_state": state}, ensure_ascii=False, allow_nan=False)}]
+        tokens = token_counter(deepcopy(candidate))
+        if type(tokens) is not int or tokens < 0:
+            raise ValueError("token_counter must return a nonnegative exact integer count")
+        if tokens + config["generation"]["max_output_tokens"] <= config["generation"]["context_tokens"]:
+            return candidate, tokens, compactions
+        if len(state["observations"]) > 1:
+            removed = state["observations"].pop(0)
+            state["older_observations_omitted"].append(removed["turn"])
+            compactions.append({"kind": "older_observation_omitted", "turn": removed["turn"]})
+            continue
+        observation = state["observations"][-1]["observation"] if state["observations"] else {}
+        if observation.get("preview_rows"):
+            observation["preview_rows"].pop()
+            observation["preview_row_count"] = len(observation["preview_rows"])
+            observation["preview_truncated"] = True
+            observation["context_preview_omitted"] = True
+            compactions.append({"kind": "sql_preview_row_omitted"})
+            continue
+        preview = next((preview for preview in reversed(observation.get("previews", [])) if preview.get("rows")), None)
+        if preview is not None:
+            row = preview["rows"].pop()
+            preview.setdefault("context_omitted_source_rows", []).insert(0, row["source_row"])
+            preview["context_shown_row_count"] = len(preview["rows"])
+            preview["context_preview_omitted"] = True
+            compactions.append({"kind": "inspection_row_omitted", "source_id": preview["source_id"], "source_row": row["source_row"]})
+            continue
+        return None, tokens, compactions
+
+
+class ReplayProvider:
+    """Replay recorded responses, mapping only known reference argument fields.
+
+    Re-execution tests control flow, not fresh model determinism or unchanged file
+    contents. Source/version manifests and production event persistence are T20.
+    """
+    def __init__(self, trajectory):
+        if type(trajectory) is not list or not trajectory:
+            raise ValueError("Replay requires a nonempty recorded trajectory")
+        if any(type(step) is not dict or not step.get("response_received") or
+               step.get("observation", {}).get("error", {}).get("kind") in {"question_deadline", "provider_error", "provider_exhausted"}
+               for step in trajectory):
+            raise ValueError("Replay requires recorded responses; provider failures/deadline timing cannot be guessed")
+        self._steps = deepcopy(trajectory)
+        self._index = 0
+
+    def __call__(self, messages, *, first_action):
+        if self._index >= len(self._steps):
+            raise StopIteration("Recorded action stream exhausted")
+        state = json.loads(messages[-1]["content"])["working_state"]
+        history = state["history"]
+        current_results = {result["result_ref"]: result for result in state["results"]}
+        if len(history) != self._index or self._steps[self._index]["first_action"] != first_action:
+            raise RuntimeError("Incompatible replay phase/step sequence")
+        mapping = {}
+        for previous, current in zip(self._steps[:self._index], history):
+            old_action = previous.get("action") or {}
+            if (old_action.get("action"), previous["status"]) != (current["action"], current["status"]):
+                raise RuntimeError("Incompatible replay action/outcome sequence")
+            old = previous.get("observation", {})
+            if "result_ref" in old:
+                new_metadata = current_results.get(current.get("result_ref"), {})
+                if (old["row_count"], old["schema"]) != (new_metadata.get("row_count"), new_metadata.get("schema")):
+                    raise RuntimeError("Incompatible replay result metadata")
+                mapping[old["result_ref"]] = current["result_ref"]
+            if "tables" in old:
+                expected = [{"table": table["table"], "row_count": table["row_count"]} for table in old["tables"]]
+                if current.get("tables") != expected:
+                    raise RuntimeError("Incompatible replay loaded tables")
+        step = self._steps[self._index]
+        self._index += 1
+        if step.get("action") is None:
+            return deepcopy(step["response"])
+        action = deepcopy(step["action"])
+        for name in ("candidate_ref", "result_ref", "check_ref"):
+            if name in action["args"] and action["args"][name] in mapping:
+                action["args"][name] = mapping[action["args"][name]]
+        return action
+
+
+def run_question(split_root, question, *, action_provider, token_counter, config, finish_handler=None):
+    """One fresh bounded episode. Default finishing is deliberately abstain-only.
+
+    Providers/finish handlers are trusted host callbacks, never model-selected
+    code. Soft question deadlines cannot preempt blocked callbacks/loaders; T20
+    supplies process watchdogs. This runner performs no real-model loading.
+    """
+    _validate_question_fields(question)
+    if not callable(action_provider) or not callable(token_counter) or (finish_handler is not None and not callable(finish_handler)):
+        raise ValueError("Expected callable provider/counter and optional finish handler")
+    config = deepcopy(config)
+    turns = config["agent"]["max_turns"]
+    deadline_seconds = config["timeouts"]["question_mac_seconds"]
+    if type(turns) is not int or not 1 <= turns <= 8:
+        raise ValueError("Question turn cap must be an integer from 1 to 8")
+    limits = (deadline_seconds, config["sql"]["timeout_seconds"], config["generation"]["context_tokens"], config["generation"]["max_output_tokens"])
+    if any(type(value) not in (int, float) or not math.isfinite(value) or value <= 0 for value in limits):
+        raise ValueError("Runtime limits must be finite positive numbers")
+    question = deepcopy(question)
+    deadline = time.monotonic() + deadline_seconds
+    trajectory, tables, source_catalog, results = [], [], [], {}
+    task_spec = None
+
+    def outcome(reason, submission=None, **extra):
+        return {"submission": submission or {"id": question["id"], "type": "abstain"}, "stop_reason": reason,
+                "turns_used": len(trajectory), "trajectory": trajectory, "source_catalog": source_catalog,
+                "results": list(results.values()), "finish_handler_used": finish_handler is not None, **extra}
+
+    with closing(create_connection(memory_limit=config["sql"]["memory_limit"], threads=config["sql"]["threads"])) as connection, ResultStore(question["id"]) as store:
+        # Setup/input errors propagate before any provider call, with resources closed.
+        prepared = prepare_business_context(split_root, question["business_id"], connection)
+        business_dir = Path(prepared["split_root"]) / "data" / question["business_id"]
+        for turn in range(1, turns + 1):
+            if time.monotonic() >= deadline:
+                return outcome("question_deadline")
+            try:
+                messages, tokens, compactions = build_run_messages(prepared, question, first_action=task_spec is None, task_spec=task_spec,
+                    tables=tables, results=results, trajectory=trajectory, token_counter=token_counter, config=config)
+            except Exception as exc:
+                return outcome("context_error", error=str(exc))
+            if messages is None:
+                return outcome("context_limit", context_tokens=tokens, compactions=compactions)
+            if time.monotonic() >= deadline:
+                return outcome("question_deadline")
+            step = {"turn": turn, "first_action": task_spec is None, "prompt_tokens": tokens, "compactions": compactions,
+                    "response": None, "response_received": False, "action": None, "status": "error"}
+            trajectory.append(step)  # Every provider invocation consumes a turn.
+            try:
+                response = action_provider(deepcopy(messages), first_action=step["first_action"])
+                step["response_received"] = True
+            except StopIteration as exc:
+                step["observation"] = {"error": {"kind": "provider_exhausted", "message": str(exc)}}
+                return outcome("provider_exhausted")
+            except ValueError as exc:
+                step["observation"] = {"error": {"kind": "action_error", "message": str(exc)}}
+                if time.monotonic() >= deadline:
+                    return outcome("question_deadline")
+                continue
+            except Exception as exc:
+                step["observation"] = {"error": {"kind": "provider_error", "message": str(exc)}}
+                return outcome("provider_error")
+            if time.monotonic() >= deadline:
+                step["observation"] = {"error": {"kind": "question_deadline", "message": "Provider exceeded question deadline"}}
+                return outcome("question_deadline")
+            try:
+                try:
+                    json.dumps(response, ensure_ascii=False, allow_nan=False)
+                except (TypeError, ValueError):
+                    raise ValueError("Provider response must contain only JSON data")
+                step["response"] = deepcopy(response)
+                action = parse_action(response, first_action=step["first_action"]) if type(response) is str else validate_action(response, first_action=step["first_action"])
+                step["action"] = action
+                if task_spec is None:
+                    task_spec = deepcopy(action["task_spec"])
+                if time.monotonic() >= deadline:
+                    step["observation"] = {"error": {"kind": "question_deadline", "message": "Action validation exceeded question deadline"}}
+                    return outcome("question_deadline")
+                name, args = action["action"], action["args"]
+                submission = None
+                if name == "inspect":
+                    observation = inspect_sources(business_dir, prepared["inventory"], **args)
+                elif name == "load":
+                    observation = load_sources(connection, business_dir, prepared["inventory"], args["requests"])
+                    tables.extend(deepcopy(observation["tables"]))
+                    source_catalog.extend(deepcopy(observation["source_catalog"]))
+                elif name == "sql":
+                    if args["kind"] == "check":
+                        store.describe(args["candidate_ref"])
+                        if results[args["candidate_ref"]]["kind"] != "compute":
+                            raise ValueError("Check candidate_ref must identify a current-question compute result")
+                    observation = execute_sql(connection, args["query"], store=store,
+                        allowed_tables={"calendar", *(table["table"] for table in tables)}, purpose=action["purpose"],
+                        timeout_seconds=min(config["sql"]["timeout_seconds"], max(.000001, deadline - time.monotonic())))
+                    metadata = {key: deepcopy(observation[key]) for key in ("result_ref", "schema", "row_count")}
+                    metadata["kind"] = args["kind"]
+                    if args["kind"] == "check":
+                        metadata["candidate_ref"] = args["candidate_ref"]
+                    results[observation["result_ref"]] = metadata
+                elif args["answer_type"] == "abstain":
+                    observation = {"finish": "abstain", "reason": args["reason"]}
+                    submission = {"id": question["id"], "type": "abstain"}
+                else:
+                    if finish_handler is None:
+                        raise ValueError("Computed/unanswerable finish validation unavailable until T17–T19; repair or abstain")
+                    if args["answer_type"] not in ("unanswerable", "abstain"):
+                        store.describe(args["result_ref"])
+                        store.describe(args["check_ref"])
+                    submission = finish_handler(deepcopy(action), question=deepcopy(question), store=store,
+                        results=deepcopy(results), source_catalog=deepcopy(source_catalog))
+                    if type(submission) is not dict or submission.get("id") != question["id"] or submission.get("type") != args["answer_type"]:
+                        raise ValueError("Finish handler must return the matching question ID and answer type")
+                    json.dumps(submission, ensure_ascii=False, allow_nan=False)
+                    observation = {"finish": "accepted_by_handler"}
+                step.update(status="ok", observation=observation)
+                if time.monotonic() >= deadline:
+                    return outcome("question_deadline")
+                if submission is not None:
+                    return outcome("abstain" if submission["type"] == "abstain" else "finish_accepted_by_handler", deepcopy(submission))
+            except (ValueError, TypeError, KeyError, OSError, TimeoutError, duckdb.Error) as exc:
+                message = str(exc)
+                if (step.get("action") or {}).get("action") == "sql" and not tables:
+                    message += " No business tables are loaded: inspect is a preview only. Use load with an explicit layout, then query its returned table/column names; only calendar is currently available."
+                step["observation"] = {"error": {"kind": "tool_or_action_error", "message": message}}
+                if time.monotonic() >= deadline:
+                    return outcome("question_deadline")
+            except Exception as exc:
+                step["observation"] = {"error": {"kind": "backend_error", "message": str(exc)}}
+                return outcome("backend_error")
+        return outcome("turn_limit")
 
 
 def _validate_question_fields(record: Any) -> None:
@@ -331,12 +755,171 @@ def generate_json(
     if not isinstance(content, str) or not content.strip():
         raise ValueError("Model returned no JSON content.")
     try:
-        result = json.loads(content, parse_constant=_reject_constant)
+        result = json.loads(content, object_pairs_hook=_unique_json_object, parse_constant=_reject_constant)
     except ValueError as exc:
         raise ValueError(f"Model returned invalid JSON: {exc}") from exc
     if not isinstance(result, dict):
         raise ValueError("Model response must be a JSON object.")
     return result
+
+
+def generate_action(model, messages, config, *, first_action: bool, metrics=None):
+    schema = get_action_schema(first_action=first_action)
+    action = generate_json(model, messages, schema, config, metrics=metrics)
+    return validate_action(action, first_action=first_action)
+
+
+class LocalActionProvider:
+    """One caller-owned local model, with per-call diagnostics and exact counts."""
+    def __init__(self, model, config, *, progress_callback=None):
+        self.model = model
+        self.config = deepcopy(config)
+        self.progress_callback = progress_callback
+        self.calls = []
+
+    def count_tokens(self, messages):
+        return count_prompt_tokens(self.model, messages)
+
+    def __call__(self, messages, *, first_action):
+        expected = self.count_tokens(messages)
+        metrics = {}
+        call = {"number": len(self.calls) + 1, "first_action": first_action, "status": "running",
+                "expected_prompt_tokens": expected, "started_monotonic": time.monotonic(),
+                "messages_sha256": hashlib.sha256(json.dumps(messages, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest(),
+                "system_prompt_sha256": hashlib.sha256(messages[0]["content"].encode()).hexdigest() if messages else None,
+                "schema_sha256": hashlib.sha256(json.dumps(get_action_schema(first_action=first_action),
+                    ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()}
+        if messages and messages[-1]["role"] == "user":
+            payload = json.loads(messages[-1]["content"])
+            if "working_state" in payload:
+                call["preceding_working_state"] = payload["working_state"]
+        self.calls.append(call)
+        if self.progress_callback:
+            self.progress_callback(deepcopy(call))
+        try:
+            action = generate_action(self.model, messages, self.config, first_action=first_action, metrics=metrics)
+            if metrics.get("usage", {}).get("prompt_tokens") != expected:
+                raise ValueError("Runtime prompt usage does not match exact token count")
+            call.update(status="passed", action=deepcopy(action))
+            return action
+        except Exception as exc:
+            call.update(status="failed", error=str(exc))
+            raise
+        finally:
+            call.update(metrics)
+            call["duration_seconds"] = time.monotonic() - call["started_monotonic"]
+            call["prompt_tokens_match"] = metrics.get("usage", {}).get("prompt_tokens") == expected
+            if self.progress_callback:
+                self.progress_callback(deepcopy(call))
+
+
+def _select_probe_question(split_root, question_id):
+    root, questions = _load_split_questions(split_root)
+    question = next((question for question in questions if question["id"] == question_id), None)
+    if question is None:
+        raise ValueError(f"Question ID {question_id!r} does not exist in {root / 'questions.jsonl'}")
+    if question["business_id"] in HELD_OUT_BUSINESSES:
+        raise ValueError("Model probe requires a development business, not a frozen validation business")
+    return root, question
+
+
+def _probe_stages(outcome):
+    stages = {name: False for name in ("inspection", "loading", "business_compute", "check_sql", "finish_proposal", "abstain_action")}
+    loaded = set()
+    dependencies = []
+    with closing(create_connection()) as connection:
+        for step in outcome.get("trajectory", []):
+            action = step.get("action") or {}
+            name, args = action.get("action"), action.get("args", {})
+            if name == "finish" and args["answer_type"] != "abstain":
+                stages["finish_proposal"] = True
+            if step["status"] != "ok":
+                continue
+            if name == "inspect":
+                stages["inspection"] = True
+            elif name == "load":
+                loaded.update(table["table"] for table in step["observation"]["tables"])
+                stages["loading"] = bool(loaded)
+            elif name == "sql":
+                if args["kind"] == "compute":
+                    names = connection.get_table_names(args["query"], qualified=False)
+                    business_tables = sorted(loaded.intersection(names))
+                    dependencies.append({"turn": step["turn"], "tables": sorted(names), "loaded_business_tables": business_tables})
+                    stages["business_compute"] |= bool(business_tables)
+                else:
+                    stages["check_sql"] = True
+            elif name == "finish" and args["answer_type"] == "abstain":
+                stages["abstain_action"] = outcome["stop_reason"] == "abstain"
+    return stages, dependencies
+
+
+def _model_probe(split_root, question, config, progress):
+    """Worker: no gold labels, scripts, injected SQL, layouts or finish handler."""
+    started = time.monotonic()
+    model = None
+    report = {"status": "running", "phase": "initializing", "active_request_started": started,
+              "scope": "One live development integration probe; production finishing/accuracy deferred",
+              "question": deepcopy(question), "split_root": str(split_root), "model": config["model"],
+              "config_sha256": hashlib.sha256(json.dumps(config, sort_keys=True, ensure_ascii=False).encode()).hexdigest(),
+              "runtime_version": importlib.metadata.version("llama-cpp-python"), "platform": sys.platform,
+              "generation": config["generation"], "limits": {"agent": config["agent"], "sql": config["sql"], "timeouts": config["timeouts"]},
+              "calls": [], "answer_validation": "deferred", "finish_handler_used": False,
+              "code_sha256": {name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest() for name in ("solver.py", "data_tools.py")},
+              "action_prompt_sha256": {phase: hashlib.sha256(_action_system_prompt(first).encode()).hexdigest()
+                                       for phase, first in (("first_action", True), ("later_action", False))}}
+    def checkpoint():
+        _save_progress(progress, report)
+    checkpoint()
+    try:
+        root = Path(split_root).resolve(strict=True)
+        business = _business_directory(root / "data", question["business_id"])
+        inventory = build_inventory(business)
+        paths = [root / "questions.jsonl", root / "rulebook.md", root / "calendar.csv", business / "README.md"]
+        paths.extend(business / file["file"] for file in inventory["files"])
+        hashes = {}
+        for path in paths:
+            with path.open("rb") as stream:
+                hashes[path.relative_to(root).as_posix()] = hashlib.file_digest(stream, "sha256").hexdigest()
+        report["input_sha256"] = hashes
+        checkpoint()
+        model = load_model(config)
+        report["load_seconds"] = time.monotonic() - started
+        report.update(phase="question", active_request_started=time.monotonic())
+        checkpoint()
+        def observe(call):
+            report["calls"] = deepcopy(provider.calls)
+            checkpoint()
+        provider = LocalActionProvider(model, config, progress_callback=observe)
+        outcome = run_question(root, question, action_provider=provider, token_counter=provider.count_tokens, config=config, finish_handler=None)
+        report["outcome"] = outcome
+        report.update(phase="checking", active_request_started=None)
+        checkpoint()
+        stages, dependencies = _probe_stages(outcome)
+        report.update(tool_stages=stages, compute_dependencies=dependencies)
+        report["token_accounting_passed"] = bool(provider.calls) and all(call.get("prompt_tokens_match") for call in provider.calls)
+        required = ("inspection", "loading", "business_compute", "abstain_action")
+        report["status"] = "passed" if report["token_accounting_passed"] and all(stages[name] for name in required) else "failed"
+        if report["status"] == "failed":
+            report["error"] = "Integration incomplete: inspect/load/business compute/normal abstention and exact token accounting are required"
+        for relative, digest in hashes.items():
+            with (root / relative).open("rb") as stream:
+                if hashlib.file_digest(stream, "sha256").hexdigest() != digest:
+                    raise ValueError(f"Probe input changed: {relative}")
+        report["input_hashes_unchanged"] = True
+    except Exception as exc:
+        report.update(status="failed", error=str(exc))
+    finally:
+        report.update(phase="closing", active_request_started=None)
+        checkpoint()
+        if model is not None:
+            try:
+                model.close()
+            except Exception as exc:
+                report.update(status="failed", error=f"Model cleanup failed: {exc}")
+        report["phase"] = "complete"
+        report["total_worker_seconds"] = time.monotonic() - started
+        checkpoint()
+    return report
 
 
 def _smoke(config: dict[str, Any]) -> dict[str, Any]:
@@ -386,8 +969,9 @@ def context_budget(prompt_tokens: int, context_tokens: int, response_tokens: int
     }
 
 
-def audit_contexts(split_roots: list[str | Path], config: dict[str, Any]) -> dict[str, Any]:
-    """Count full T6 prompts with one vocabulary-only model; never generate answers.
+def audit_contexts(split_roots: list[str | Path], config: dict[str, Any], *, include_actions: bool = False,
+                   progress_path: str | Path | None = None) -> dict[str, Any]:
+    """Count base or both T14 action prompts with one vocabulary-only model.
 
     Run in a process bounded to 300 seconds. The caller persists this report;
     failures retain completed business summaries and never truncate documents.
@@ -400,9 +984,25 @@ def audit_contexts(split_roots: list[str | Path], config: dict[str, Any]) -> dic
         "model": config["model"], "generation": config["generation"], "tokenizer_mode": "vocabulary_only_cpu",
         "runtime_version": importlib.metadata.version("llama-cpp-python"), "process_deadline_seconds": 300,
         "working_reserve_tokens": WORKING_RESERVE_TOKENS, "input_hashes": {}, "businesses": [],
-        "contexts_counted": 0, "overflows": [], "scan_complete": False,
+        "contexts_counted": 0, "prompt_variants_counted": 0, "overflows": [], "scan_complete": False,
         "system_prompt_sha256": hashlib.sha256(INITIAL_SYSTEM_PROMPT.encode("utf-8")).hexdigest(),
     }
+    if type(include_actions) is not bool:
+        raise ValueError("include_actions must be a Boolean")
+    if include_actions:
+        report["scope"] = "T14 first/later action prompts; no generation or business rows"
+        report["action_schema_sha256"] = {phase: hashlib.sha256(json.dumps(get_action_schema(first_action=first),
+            ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
+            for phase, first in (("first_action", True), ("later_action", False))}
+        report["action_prompt_sha256"] = {phase: hashlib.sha256(_action_system_prompt(first).encode()).hexdigest()
+            for phase, first in (("first_action", True), ("later_action", False))}
+
+    def progress():
+        if progress_path is not None:
+            report["total_seconds"] = time.monotonic() - started
+            _save_progress(Path(progress_path), report)
+
+    progress()
     try:
         path = verify_model_artifact(config)
         settings = config["generation"]
@@ -415,25 +1015,40 @@ def audit_contexts(split_roots: list[str | Path], config: dict[str, Any]) -> dic
                 for question in questions:
                     grouped.setdefault(question["business_id"], []).append(question)
                 for business_id, business_questions in sorted(grouped.items()):
-                    with closing(duckdb.connect(":memory:")) as connection:
+                    with closing(create_connection()) as connection:
                         prepared = prepare_business_context(root, business_id, connection)
                         for name, digest in prepared["document_hashes"].items():
                             report["input_hashes"][f"{root.name}/{name}"] = digest
                         maximum = None
+                        phase_maxima = {}
                         for question in business_questions:
-                            messages = build_initial_messages(prepared, question)
-                            tokens = count_prompt_tokens(tokenizer, messages)
-                            budget = context_budget(tokens, settings["context_tokens"], settings["max_output_tokens"])
-                            case = {"split": root.name, "business_id": business_id, "question_id": question["id"], **budget}
-                            if not budget["reserved_fits"]:
-                                report["overflows"].append(case)
-                            if maximum is None or tokens > maximum["prompt_tokens"]:
-                                maximum = case
+                            variants = (("first_action", True), ("later_action", False)) if include_actions else (("base", None),)
+                            for phase, first in variants:
+                                messages = (build_action_messages(prepared, question, first_action=first) if include_actions
+                                            else build_initial_messages(prepared, question))
+                                tokens = count_prompt_tokens(tokenizer, messages)
+                                budget = context_budget(tokens, settings["context_tokens"], settings["max_output_tokens"])
+                                case = {"split": root.name, "business_id": business_id, "question_id": question["id"], **budget}
+                                if include_actions:
+                                    case["phase"] = phase
+                                if not budget["reserved_fits"]:
+                                    report["overflows"].append(case)
+                                if maximum is None or tokens > maximum["prompt_tokens"]:
+                                    maximum = case
+                                if phase not in phase_maxima or tokens > phase_maxima[phase]["prompt_tokens"]:
+                                    phase_maxima[phase] = case
+                                report["prompt_variants_counted"] += 1
                             report["contexts_counted"] += 1
+                            if report["contexts_counted"] % 50 == 0:
+                                report["current_business"] = {"split": root.name, "business_id": business_id, "phase_maxima": phase_maxima}
+                                progress()
                         report["businesses"].append({
                             **maximum, "question_count": len(business_questions), "calendar": prepared["calendar"],
                             "inventory_sha256": hashlib.sha256(json.dumps(prepared["inventory"], sort_keys=True, ensure_ascii=False).encode()).hexdigest(),
+                            **({"phase_maxima": phase_maxima} if include_actions else {}),
                         })
+                        report.pop("current_business", None)
+                        progress()
         if not report["contexts_counted"]:
             raise ValueError("No question contexts were supplied")
         report["scan_complete"] = True
@@ -444,6 +1059,7 @@ def audit_contexts(split_roots: list[str | Path], config: dict[str, Any]) -> dic
     except (OSError, ValueError, RuntimeError) as exc:
         report.update(status="failed", error=str(exc))
     report["total_seconds"] = time.monotonic() - started
+    progress()
     return report
 
 
@@ -677,7 +1293,8 @@ def _feasibility(config: dict[str, Any], config_path: Path, progress: Path) -> d
     return report
 
 
-def _run_feasibility_worker(command: list[str], progress: Path, *, overall_seconds: float = FEASIBILITY_SECONDS, request_seconds: float = 300) -> tuple[dict, str]:
+def _run_feasibility_worker(command: list[str], progress: Path, *, overall_seconds: float = FEASIBILITY_SECONDS,
+                            request_seconds: float = 300, initialization_seconds: float | None = None) -> tuple[dict, str]:
     """A parent watchdog can interrupt blocked native calls without reloading per probe."""
     started = time.monotonic()
     failure = None
@@ -692,6 +1309,8 @@ def _run_feasibility_worker(command: list[str], progress: Path, *, overall_secon
                 active = partial.get("active_request_started")
                 if now - started >= overall_seconds:
                     failure = f"Feasibility worker exceeded {overall_seconds} seconds."
+                elif initialization_seconds is not None and partial.get("phase", "initializing") == "initializing" and now - started >= initialization_seconds:
+                    failure = f"Model initialization exceeded {initialization_seconds} seconds."
                 elif active is not None and now - active >= request_seconds:
                     failure = f"Diagnostic request exceeded {request_seconds} seconds."
                 if failure:
@@ -743,6 +1362,7 @@ def main() -> int:
     modes.add_argument("--validate-questions", type=Path, metavar="PATH", help="Validate question JSONL without loading a model")
     modes.add_argument("--inventory", type=Path, metavar="BUSINESS_DIR", help="List source metadata without loading a model")
     modes.add_argument("--context", metavar="QUESTION_ID", help="Prepare initial question messages without loading a model")
+    modes.add_argument("--model-probe", metavar="QUESTION_ID", help="Run one live development probe with abstention-only finishing")
     modes.add_argument("--inspect", type=Path, metavar="BUSINESS_DIR", help="Preview raw source rows without loading a model")
     modes.add_argument("--load-csv", type=Path, metavar="BUSINESS_DIR", help="Load one explicitly laid-out CSV into temporary DuckDB")
     modes.add_argument("--load-excel", type=Path, metavar="BUSINESS_DIR", help="Load one explicitly laid-out worksheet into temporary DuckDB")
@@ -759,11 +1379,13 @@ def main() -> int:
     parser.add_argument("--split-root", type=Path, metavar="PATH", help="Split directory for --context")
     modes.add_argument("--_smoke-worker", action="store_true", help=argparse.SUPPRESS)
     modes.add_argument("--_feasibility-worker", action="store_true", help=argparse.SUPPRESS)
+    modes.add_argument("--_model-probe-worker", metavar="QUESTION_ID", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if (args.validate_questions is None) != (args.data_root is None):
         parser.error("--validate-questions and --data-root must be supplied together")
-    if (args.context is None) != (args.split_root is None):
-        parser.error("--context and --split-root must be supplied together")
+    split_mode = args.context is not None or args.model_probe is not None or args._model_probe_worker is not None
+    if split_mode != (args.split_root is not None):
+        parser.error("--context/--model-probe and --split-root must be supplied together")
     if (args.load_sources is None) != (args.requests_file is None):
         parser.error("--load-sources and --requests-file must be supplied together")
     inspection_flags = (args.source_ids, args.start_row, args.row_count)
@@ -773,12 +1395,46 @@ def main() -> int:
     loading_root = next((root for root in (args.load_csv, args.load_excel, args.load_sqlite) if root is not None), None)
     if loading_root is None and any(value is not None for value in loading_flags):
         parser.error("--source-id requires a loading mode; layout flags require --load-csv or --load-excel")
+    if args.model_probe is not None or args._model_probe_worker is not None:
+        try:
+            question_id = args.model_probe or args._model_probe_worker
+            root, question = _select_probe_question(args.split_root, question_id)
+            config = load_config(args.config)
+            output_dir = args.config.resolve().parent / "artifacts"
+            output_dir.mkdir(exist_ok=True)
+            progress = output_dir / "t16-progress.json"
+            if args._model_probe_worker is not None:
+                print(json.dumps(_model_probe(root, question, config, progress), ensure_ascii=False, allow_nan=False))
+                return 0
+            previous = [output_dir / name for name in ("t16-progress.json", "t16-probe.json", "t16-metal.log") if (output_dir / name).exists()]
+            if previous:
+                archive = output_dir / "t16-attempts" / str(time.time_ns())
+                archive.mkdir(parents=True)
+                for path in previous:
+                    path.replace(archive / path.name)
+            command = [sys.executable, str(Path(__file__).resolve()), "--config", str(args.config.resolve()),
+                       "--_model-probe-worker", question_id, "--split-root", str(root)]
+            report, log = _run_feasibility_worker(command, progress, overall_seconds=600,
+                                                 request_seconds=config["timeouts"]["question_mac_seconds"], initialization_seconds=300)
+            try:
+                report.update(_gpu_evidence(log))
+            except RuntimeError as exc:
+                report.update(status="failed", error=str(exc))
+            report["native_buffer_peak_bytes_by_label"] = _metal_allocations(log)
+            (output_dir / "t16-metal.log").write_text(log, encoding="utf-8")
+            _save_progress(output_dir / "t16-probe.json", report)
+            print(json.dumps({"status": report["status"], "tool_stages": report.get("tool_stages"),
+                              "stop_reason": report.get("outcome", {}).get("stop_reason"), "error": report.get("error"),
+                              "report": str(output_dir / "t16-probe.json")}, ensure_ascii=False))
+            return 0 if report["status"] == "passed" else 1
+        except (OSError, ValueError, RuntimeError) as exc:
+            print(f"Model probe error: {exc}", file=sys.stderr)
+            return 1
     if args.load_sources is not None:
         try:
             requests = json.loads(args.requests_file.read_text(encoding="utf-8"), object_pairs_hook=_unique_json_object, parse_constant=_reject_constant)
             catalog = build_inventory(args.load_sources)
-            with closing(duckdb.connect(":memory:", config={"enable_external_access": False, "autoinstall_known_extensions": False,
-                                                         "autoload_known_extensions": False, "memory_limit": "1GB", "threads": 2})) as connection:
+            with closing(create_connection()) as connection:
                 result = load_sources(connection, args.load_sources, catalog, requests)
             print(json.dumps(result, ensure_ascii=False, allow_nan=False, indent=2))
             return 0
@@ -800,8 +1456,7 @@ def main() -> int:
         try:
             catalog = build_inventory(loading_root)
             loader = load_csv if args.load_csv is not None else load_excel if args.load_excel is not None else load_sqlite
-            with closing(duckdb.connect(":memory:", config={"enable_external_access": False, "autoinstall_known_extensions": False,
-                                                         "autoload_known_extensions": False, "memory_limit": "1GB", "threads": 2})) as connection:
+            with closing(create_connection()) as connection:
                 kwargs = {} if args.load_sqlite is not None else {"header_rows": args.header_rows, "first_data_row": args.first_data_row}
                 result = loader(connection, loading_root, catalog, args.source_id, **kwargs)
             print(json.dumps(result, ensure_ascii=False, allow_nan=False, indent=2))
@@ -831,9 +1486,9 @@ def main() -> int:
             question = next((q for q in questions if q["id"] == args.context), None)
             if question is None:
                 raise ValueError(f"Question ID {args.context!r} does not exist in {root / 'questions.jsonl'}")
-            with closing(duckdb.connect(":memory:")) as connection:
+            with closing(create_connection()) as connection:
                 prepared = prepare_business_context(root, question["business_id"], connection)
-                messages = build_initial_messages(prepared, question)
+                messages = build_action_messages(prepared, question)
             print(json.dumps(messages, ensure_ascii=False, allow_nan=False, indent=2))
             return 0
         except (OSError, RuntimeError, ValueError, duckdb.Error) as exc:

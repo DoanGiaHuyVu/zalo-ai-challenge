@@ -6,6 +6,7 @@ from contextlib import closing, contextmanager, suppress
 import base64
 import csv
 from datetime import date, datetime, time, timedelta
+from decimal import Decimal
 import hashlib
 import io
 from itertools import islice
@@ -13,9 +14,14 @@ import json
 import math
 import os
 from pathlib import Path
+import pickle
 import re
 import sqlite3
+import threading
+import time as clock
 from typing import Any
+from uuid import UUID, uuid4
+from weakref import WeakKeyDictionary
 import xml.etree.ElementTree as ET
 import zipfile
 
@@ -34,6 +40,445 @@ INSPECT_MAX_BYTES = 16 * 1024
 CSV_CHUNK_ROWS = 4096
 EXCEL_CHUNK_ROWS = 4096
 SQLITE_CHUNK_ROWS = 4096
+RESULT_CHUNK_ROWS = 4096
+RESULT_MAX_BYTES = 32 * 1024**2
+RESULT_PREVIEW_ROWS = 12
+RESULT_PREVIEW_BYTES = 16 * 1024
+
+_SQL_SECURITY = {
+    "enable_external_access": False, "autoinstall_known_extensions": False,
+    "autoload_known_extensions": False, "allow_unsigned_extensions": False,
+    "allow_community_extensions": False, "python_enable_replacements": False,
+    "python_scan_all_frames": False, "allowed_paths": "[]", "allowed_directories": "[]",
+    "temp_directory": "",
+}
+_SQL_TABLE_FUNCTIONS = frozenset({"range", "generate_series", "unnest", "json_each", "json_tree"})
+_SQL_MACROS = frozenset({"if", "nullif", "date_add"})
+_SQL_QUERY_NODES = frozenset({"SELECT_NODE", "SET_OPERATION_NODE", "RECURSIVE_CTE_NODE"})
+_SQL_TABLE_NODES = frozenset({"BASE_TABLE", "EMPTY", "JOIN", "SUBQUERY", "TABLE_FUNCTION", "EXPRESSION_LIST"})
+_SQL_EXPRESSIONS = frozenset({"CONSTANT", "COLUMN_REF", "STAR", "FUNCTION", "WINDOW", "CAST", "CASE",
+                            "COMPARISON", "CONJUNCTION", "OPERATOR", "SUBQUERY", "LAMBDA", "BETWEEN",
+                            "TYPE", "POSITIONAL_REFERENCE", "COLLATE"})
+_SQL_WRAPPERS = frozenset({"ORDER_MODIFIER", "DISTINCT_MODIFIER", "LIMIT_MODIFIER", "LIMIT_PERCENT_MODIFIER",
+                         "ORDER_DEFAULT", "ASCENDING", "DESCENDING"})
+_SQL_CATALOGS = WeakKeyDictionary()
+
+
+def create_connection(*, memory_limit: str = "1GB", threads: int = 2):
+    """Caller-owned in-memory database; only trusted Python code may ingest data.
+
+    Settings are defense in depth, not an OS sandbox. Do not install host UDFs,
+    custom casts, macros or extensions on a connection exposed to model SQL.
+    """
+    if duckdb.__version__ != "2.0.0":
+        raise ValueError("SQL policy requires the pinned DuckDB 2.0.0 parser/catalog")
+    if not isinstance(memory_limit, str) or not memory_limit.strip() or type(threads) is not int or threads < 1:
+        raise ValueError("Expected a memory-limit string and positive integer threads")
+    startup = {key: value for key, value in _SQL_SECURITY.items()
+               if key not in {"allowed_paths", "allowed_directories", "enable_external_access"}}
+    connection = duckdb.connect(":memory:", config={**startup, "memory_limit": memory_limit, "threads": threads})
+    try:
+        # Starting with external access off adds pseudo database/WAL paths to
+        # DuckDB's allowlist. Clear the lists before disabling access and locking;
+        # no source/model SQL runs during this private bootstrap sequence.
+        connection.execute("SET allowed_paths = []")
+        connection.execute("SET allowed_directories = []")
+        connection.execute("SET enable_external_access = false")
+        connection.execute("SET lock_configuration = true")
+        # Python UDFs also claim internal=True in this runtime. Pin identities
+        # before host registrations; later additions/overrides are not built-ins.
+        _SQL_CATALOGS[connection] = frozenset(connection.execute(
+            "SELECT function_name, function_type, function_oid FROM duckdb_functions()").fetchall())
+        return connection
+    except Exception:
+        connection.close()
+        raise
+
+
+def _check_sql_connection(connection: Any) -> None:
+    settings = dict(connection.execute("SELECT name, value FROM duckdb_settings()").fetchall())
+    for name, expected in {**_SQL_SECURITY, "lock_configuration": True}.items():
+        value = str(expected).lower() if isinstance(expected, bool) else expected
+        if settings.get(name) != value:
+            raise ValueError(f"SQL requires a secured connection: {name} must be {value!r}; use create_connection()")
+
+
+def _sql_functions(connection: Any, baseline: frozenset) -> tuple[set[str], set[str]]:
+    rows = connection.execute("SELECT function_name, function_type, function_oid, internal, has_side_effects FROM duckdb_functions()").fetchall()
+    scalar, table = {}, {}
+    for name, kind, oid, internal, effects in rows:
+        original = (name, kind, oid) in baseline
+        name = name.casefold()
+        if kind == "table":
+            table[name] = table.get(name, True) and original and internal and name in _SQL_TABLE_FUNCTIONS
+        elif kind == "table_macro":
+            table[name] = False
+        elif kind in {"scalar", "aggregate", "window", "macro"}:
+            pure = effects is False if kind != "macro" else name in _SQL_MACROS
+            scalar[name] = scalar.get(name, True) and original and internal and pure
+    return {name for name, allowed in scalar.items() if allowed}, {name for name, allowed in table.items() if allowed}
+
+
+def _validate_sql_tree(tree: Any, allowed_tables: set[str], scalar_functions: set[str], table_functions: set[str]) -> None:
+    """Walk the pinned parser tree, retaining lexical CTE visibility."""
+    if not isinstance(tree, dict) or tree.get("type") not in _SQL_QUERY_NODES:
+        raise ValueError("Unsupported SQL query tree")
+    def function(node, permitted):
+        name = node.get("function_name", "").casefold()
+        if node.get("catalog") or node.get("schema", "") not in ("", "main") or name not in permitted:
+            raise ValueError(f"SQL function is not permitted: {node.get('function_name')!r}")
+
+    def walk(value, scope=frozenset(), table_function=False):
+        if isinstance(value, list):
+            for item in value:
+                walk(item, scope)
+            return
+        if not isinstance(value, dict):
+            return
+        kind, expression = value.get("type"), value.get("class")
+        if kind in _SQL_QUERY_NODES:
+            local = set(scope)
+            definitions = value.get("cte_map", {}).get("map", [])
+            for entry in definitions:
+                # An ordinary CTE does not see itself: DuckDB may otherwise bind
+                # that name to a real table, including one outside our allowlist.
+                walk(entry["value"]["query_node"], frozenset(local))
+                local.add(entry["key"].casefold())
+                for key, item in entry["value"].items():
+                    if key != "query_node":
+                        walk(item, frozenset(local))
+            local = frozenset(local)
+            if kind == "RECURSIVE_CTE_NODE":
+                # Only the recursive arm sees the CTE's own name, not its anchor.
+                walk(value["left"], local)
+                walk(value["right"], local | {value["cte_name"].casefold()})
+            for key, item in value.items():
+                if key != "cte_map" and not (kind == "RECURSIVE_CTE_NODE" and key in {"left", "right"}):
+                    walk(item, local)
+            return
+        if expression:
+            if expression not in _SQL_EXPRESSIONS:
+                raise ValueError(f"Unsupported SQL expression: {expression}")
+            if expression in {"FUNCTION", "WINDOW"}:
+                function(value, table_functions if table_function else scalar_functions)
+            if expression == "TYPE" and (value.get("catalog") or value.get("schema")):
+                raise ValueError("Qualified/custom SQL types are not permitted")
+        elif kind in _SQL_TABLE_NODES:
+            if kind == "BASE_TABLE":
+                name = value["table_name"].casefold()
+                schema, catalog = value.get("schema_name", ""), value.get("catalog_name", "")
+                cte = not schema and not catalog and name in scope
+                if not cte and (catalog or schema not in ("", "main") or name not in allowed_tables):
+                    raise ValueError(f"SQL table is not permitted: {value['table_name']!r}")
+                if value.get("at_clause") is not None:
+                    raise ValueError("Temporal table references are not permitted")
+            if kind == "TABLE_FUNCTION":
+                if value.get("function", {}).get("class") != "FUNCTION":
+                    raise ValueError("Expected a permitted named table function")
+                walk(value["function"], scope, table_function=True)
+        elif kind is not None and kind not in _SQL_WRAPPERS:
+            raise ValueError(f"Unsupported SQL structure: {kind}")
+        for key, item in value.items():
+            if not (kind == "TABLE_FUNCTION" and key == "function"):
+                walk(item, scope)
+
+    walk(tree)
+
+
+def _validate_sql(connection: Any, sql: str, allowed_tables: Any, baseline: frozenset) -> None:
+    if not isinstance(sql, str) or not sql.strip():
+        raise ValueError("SQL must be a nonempty string")
+    if not isinstance(allowed_tables, (set, frozenset, list, tuple)) or any(not isinstance(name, str) or not name for name in allowed_tables):
+        raise ValueError("allowed_tables must contain host-selected physical table names")
+    allowed = {name.casefold() for name in allowed_tables}
+    physical = {name.casefold() for (name,) in connection.execute(
+        "SELECT table_name FROM duckdb_tables() WHERE schema_name='main' AND NOT internal AND NOT temporary").fetchall()}
+    if not allowed <= physical:
+        raise ValueError(f"Allowed tables must be physical main tables, not views/staging objects: {sorted(allowed - physical)}")
+    try:
+        statements = connection.extract_statements(sql)
+    except duckdb.Error as exc:
+        raise ValueError(f"Cannot parse SQL: {exc}") from exc
+    if len(statements) != 1 or statements[0].type != duckdb.StatementType.SELECT:
+        raise ValueError("SQL must contain exactly one SELECT statement (CTEs are allowed)")
+    if statements[0].named_parameters:
+        raise ValueError("SQL must not contain unbound parameters")
+    serialized = json.loads(connection.execute("SELECT json_serialize_sql(?)", [sql]).fetchone()[0])
+    if serialized.get("error") or len(serialized.get("statements", [])) != 1:
+        raise ValueError(f"Unsupported SQL syntax: {serialized.get('error_message', 'cannot inspect syntax tree')}")
+    scalar, table = _sql_functions(connection, baseline)
+    try:
+        _validate_sql_tree(serialized["statements"][0]["node"], allowed, scalar, table)
+    except (KeyError, TypeError, RecursionError) as exc:
+        raise ValueError("Unsupported SQL syntax tree for pinned runtime") from exc
+
+
+@contextmanager
+def restricted_query(connection: Any, sql: str, *, allowed_tables: Any, timeout_seconds: float = 10):
+    """Yield a host-only cursor; validate/execute/consume inside one deadline.
+
+    Requires an idle caller-owned connection and serial access. A dedicated
+    cursor owns the read transaction: closing it early leaves the caller open.
+    Publish results only after this context exits successfully. Cancellation is
+    cooperative; the later process watchdog remains the hard failure boundary.
+    """
+    if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)) or not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+        raise ValueError("timeout_seconds must be a finite positive number")
+    baseline = _SQL_CATALOGS.get(connection)
+    if baseline is None:
+        raise ValueError("SQL requires a secured connection from create_connection()")
+    cursor = connection.cursor()
+    expired = threading.Event()
+    finished = threading.Event()
+    deadline = clock.monotonic() + timeout_seconds
+
+    def interrupt():
+        expired.set()
+        # A one-shot interrupt can arrive between validation and execute, when
+        # no native query is active. Keep interrupting until cleanup acknowledges
+        # cancellation, closing that race without leaving a late timer behind.
+        while not finished.is_set():
+            with suppress(duckdb.Error):
+                cursor.interrupt()
+            finished.wait(.01)
+
+    timer = threading.Timer(timeout_seconds, interrupt)
+    timer.daemon = True
+    started = False
+    timer_started = False
+    try:
+        timer.start()
+        timer_started = True
+        _check_sql_connection(cursor)
+        cursor.execute("BEGIN TRANSACTION READ ONLY")
+        started = True
+        _validate_sql(cursor, sql, allowed_tables, baseline)
+        if expired.is_set() or clock.monotonic() >= deadline:
+            raise TimeoutError(f"SQL exceeded {timeout_seconds:g}-second deadline")
+        cursor.execute(sql)
+        yield cursor
+    except Exception as exc:
+        if expired.is_set() or clock.monotonic() >= deadline:
+            raise TimeoutError(f"SQL exceeded {timeout_seconds:g}-second deadline") from exc
+        raise
+    finally:
+        finished.set()
+        timer.cancel()
+        if timer_started:
+            timer.join()
+        if started:
+            with suppress(duckdb.Error):
+                cursor.execute("ROLLBACK")
+        cursor.close()
+    if expired.is_set() or clock.monotonic() >= deadline:
+        raise TimeoutError(f"SQL exceeded {timeout_seconds:g}-second deadline")
+
+
+class ResultStore:
+    """Question-attempt-local, host-only typed payloads; never load external pickle.
+
+    The byte budget counts serialized metadata/chunks, not total process RSS or
+    temporary decoded objects. Use serial access and publish only complete SQL
+    results. Stored immutable bytes isolate results from caller mutations.
+    """
+    def __init__(self, question_id: str, *, max_bytes: int = RESULT_MAX_BYTES):
+        if type(question_id) is not str or not question_id.strip():
+            raise ValueError("question_id must be a nonempty string")
+        if type(max_bytes) is not int or max_bytes < 1:
+            raise ValueError("max_bytes must be a positive integer")
+        self._question_id = question_id
+        self._max_bytes = max_bytes
+        self._used_bytes = 0
+        self._entries: dict[str, tuple[bytes, tuple[bytes, ...]]] = {}
+        self._identity = uuid4().hex
+        self._sequence = 0
+        self._closed = False
+
+    @property
+    def question_id(self):
+        return self._question_id
+
+    @property
+    def max_bytes(self):
+        return self._max_bytes
+
+    @property
+    def used_bytes(self):
+        return self._used_bytes
+
+    def _ensure_open(self):
+        if self._closed:
+            raise ValueError("Result store is closed")
+
+    def _new_reference(self):
+        self._ensure_open()
+        self._sequence += 1
+        return f"R_{self._identity}_{self._sequence:03d}"
+
+    def _lookup(self, result_ref):
+        self._ensure_open()
+        if not isinstance(result_ref, str) or result_ref not in self._entries:
+            raise ValueError("Unknown, stale, or other-attempt result reference")
+        return self._entries[result_ref]
+
+    def _check_capacity(self, size):
+        self._ensure_open()
+        if size > self._max_bytes - self._used_bytes:
+            raise ValueError("Result exceeds remaining per-question stored-payload budget; select fewer columns or aggregate in SQL")
+
+    def _publish(self, result_ref, metadata, chunks):
+        self._ensure_open()
+        if not result_ref.startswith(f"R_{self._identity}_") or result_ref in self._entries:
+            raise ValueError("Result scope changed before publication")
+        size = len(metadata) + sum(map(len, chunks))
+        self._check_capacity(size)
+        self._entries[result_ref] = (metadata, chunks)
+        self._used_bytes += size
+
+    def describe(self, result_ref):
+        metadata, chunks = self._lookup(result_ref)
+        description = pickle.loads(metadata)
+        description["stored_bytes"] = len(metadata) + sum(map(len, chunks))
+        return description
+
+    def iter_rows(self, result_ref):
+        self._lookup(result_ref)
+
+        def rows():
+            index = 0
+            while True:
+                entry = self._lookup(result_ref)
+                if index == len(entry[1]):
+                    return
+                chunk = pickle.loads(entry[1][index])
+                del entry
+                index += 1
+                for row in chunk:
+                    self._lookup(result_ref)  # Clear/close also invalidates active iterators.
+                    yield row
+
+        return rows()
+
+    def clear(self):
+        self._ensure_open()
+        self._entries.clear()
+        self._used_bytes = 0
+        self._identity = uuid4().hex
+        self._sequence = 0
+
+    def close(self):
+        if not self._closed:
+            self.clear()
+            self._closed = True
+
+    def __enter__(self):
+        self._ensure_open()
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+
+
+def _validate_result_value(value: Any) -> None:
+    kind = type(value)
+    if value is None or kind in {str, bool, int, float, Decimal, date, datetime, time, timedelta, UUID, bytes}:
+        return
+    if kind in {list, tuple}:
+        for item in value:
+            _validate_result_value(item)
+        return
+    if kind is dict:
+        for key, item in value.items():
+            _validate_result_value(key)
+            _validate_result_value(item)
+        return
+    raise ValueError(f"Unsupported SQL result value type: {kind.__name__}; cast it explicitly in SQL")
+
+
+def _result_preview_value(value: Any) -> Any:
+    if type(value) is Decimal:
+        return {"type": "decimal", "value": str(value)}
+    if type(value) is UUID:
+        return {"type": "uuid", "value": str(value)}
+    if type(value) is list:
+        return [_result_preview_value(item) for item in value]
+    if type(value) is tuple:
+        return {"type": "tuple", "items": [_result_preview_value(item) for item in value]}
+    if type(value) is dict:
+        if all(type(key) is str for key in value):
+            return {key: _result_preview_value(item) for key, item in value.items()}
+        return {"type": "map", "entries": [[_result_preview_value(key), _result_preview_value(item)] for key, item in value.items()]}
+    return _preview_value(value)
+
+
+def _result_observation(result_ref, schema, row_count, preview, stored_bytes, row_limit, byte_limit):
+    observation = {"result_ref": result_ref, "schema": schema, "row_count": row_count,
+                   "is_preview": True, "preview_rows": preview, "preview_row_count": len(preview),
+                   "preview_truncated": len(preview) < row_count, "stored_bytes": stored_bytes}
+    while True:
+        observation["preview_row_count"] = len(preview)
+        observation["preview_truncated"] = len(preview) < row_count
+        if not preview and row_count:
+            observation["preview_omitted_reason"] = "disabled_by_host" if row_limit == 0 else "first_row_exceeds_byte_budget"
+            if row_limit:
+                observation["instruction"] = "Full result retained; select fewer columns or narrower expressions in SQL to inspect it."
+        size = len(json.dumps(observation, ensure_ascii=False, allow_nan=False).encode("utf-8"))
+        if size <= byte_limit:
+            return observation
+        if not preview:
+            raise ValueError("Result observation metadata exceeds preview byte budget; select fewer columns or shorter aliases")
+        preview.pop()  # Whole leading rows survive; individual cell values never change.
+
+
+def execute_sql(connection: Any, sql: str, *, store: ResultStore, allowed_tables: Any, purpose: str,
+                timeout_seconds: float = 10, preview_rows: int = RESULT_PREVIEW_ROWS,
+                preview_bytes: int = RESULT_PREVIEW_BYTES) -> dict[str, Any]:
+    """Consume a restricted query completely, then atomically publish its reference.
+
+    Row/byte preview limits are host-owned and can be lowered. This function
+    creates no SQL result tables, final answers, check bindings or model actions.
+    """
+    if not isinstance(store, ResultStore):
+        raise ValueError("store must be a question-local ResultStore")
+    store._ensure_open()
+    if type(sql) is not str or not sql.strip():
+        raise ValueError("sql must be a nonempty string")
+    if type(purpose) is not str or not purpose.strip():
+        raise ValueError("purpose must be a nonempty string")
+    if type(preview_rows) is not int or not 0 <= preview_rows <= RESULT_PREVIEW_ROWS:
+        raise ValueError(f"preview_rows must be an integer from 0 to {RESULT_PREVIEW_ROWS}")
+    if type(preview_bytes) is not int or not 1 <= preview_bytes <= RESULT_PREVIEW_BYTES:
+        raise ValueError(f"preview_bytes must be an integer from 1 to {RESULT_PREVIEW_BYTES}")
+    result_ref = store._new_reference()
+    chunks, preview = [], []
+    count = payload_bytes = 0
+    with restricted_query(connection, sql, allowed_tables=allowed_tables, timeout_seconds=timeout_seconds) as cursor:
+        schema = [{"position": i, "name": column[0], "type": str(column[1])} for i, column in enumerate(cursor.description, 1)]
+        while batch := cursor.fetchmany(RESULT_CHUNK_ROWS):
+            try:
+                for row in batch:
+                    for value in row:
+                        _validate_result_value(value)
+                    if len(preview) < preview_rows:
+                        preview.append([_result_preview_value(value) for value in row])
+                chunk = pickle.dumps(tuple(batch), protocol=5)
+            except (TypeError, OverflowError, RecursionError, pickle.PickleError) as exc:
+                raise ValueError(f"Cannot serialize SQL result: {exc}; cast unsupported values in SQL") from exc
+            payload_bytes += len(chunk)
+            store._check_capacity(payload_bytes)
+            chunks.append(chunk)
+            count += len(batch)
+        try:
+            metadata = pickle.dumps({"result_ref": result_ref, "question_id": store.question_id, "sql": sql,
+                                     "purpose": purpose, "schema": schema, "row_count": count}, protocol=5)
+        except (TypeError, OverflowError, pickle.PickleError) as exc:
+            raise ValueError(f"Cannot serialize SQL result metadata: {exc}") from exc
+        stored_bytes = payload_bytes + len(metadata)
+        store._check_capacity(stored_bytes)
+        observation = _result_observation(result_ref, schema, count, preview, stored_bytes, preview_rows, preview_bytes)
+        pending_chunks = tuple(chunks)
+    store._publish(result_ref, metadata, pending_chunks)
+    return observation
 
 
 def _preview_value(value: Any, cell_type: str | None = None) -> Any:
